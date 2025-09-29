@@ -1,0 +1,324 @@
+# federated_paillier_iid.py
+# Requires: pip install phe tensorflow scikit-learn matplotlib
+
+import os
+import random
+import numpy as np
+import tensorflow as tf
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+from collections import Counter, defaultdict
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.preprocessing.image import load_img, img_to_array
+from tensorflow.keras.applications import EfficientNetB3
+from tensorflow.keras import layers, models, regularizers
+
+# Paillier library
+from phe import paillier
+
+# ---------------------------
+# Constants (adjust as needed)
+# ---------------------------
+DATA_DIR = '/kaggle/input/tomato-lef-disease-augmented/'  # change to your dataset path
+BATCH_SIZE = 16
+EPOCHS = 5        # lowered for quick runs; set higher for real training
+NUM_CLASSES = 4
+FRAC_CLIENTS = 0.5
+NUM_CLIENTS = 4
+FED_ROUNDS = 5
+SEED = 42
+SCALE = 10**6     # scale factor when encoding floats to ints
+
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+# ---------------------------
+# Utility: load file paths & labels
+# ---------------------------
+def load_data(data_dir):
+    images, labels = [], []
+    class_names = sorted([c for c in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, c))])
+    for label, class_name in enumerate(class_names):
+        class_dir = os.path.join(data_dir, class_name)
+        for img_name in os.listdir(class_dir):
+            img_path = os.path.join(class_dir, img_name)
+            if os.path.isfile(img_path):
+                images.append(img_path)
+                labels.append(label)
+    images = np.array(images)
+    labels = np.array(labels)
+    return images, labels, class_names
+
+# ---------------------------
+# IID client splitter
+# ---------------------------
+def create_iid_clients(x, y, num_clients):
+    per_class_indices = defaultdict(list)
+    for idx, lbl in enumerate(y):
+        per_class_indices[int(lbl)].append(idx)
+
+    # shuffle indices per class
+    for cls in per_class_indices:
+        random.shuffle(per_class_indices[cls])
+
+    clients_indices = [[] for _ in range(num_clients)]
+
+    # round-robin distribution per class
+    for cls, indices in per_class_indices.items():
+        for i, idx in enumerate(indices):
+            client_id = i % num_clients
+            clients_indices[client_id].append(idx)
+
+    # Convert indices to (paths, labels) tuples
+    clients_data = []
+    for inds in clients_indices:
+        inds = sorted(inds)
+        client_x = x[inds]
+        client_y = y[inds]
+        clients_data.append((client_x, client_y))
+
+    return clients_data
+
+# ---------------------------
+# Generator to load images
+# ---------------------------
+def image_generator(file_paths, labels, batch_size, shuffle=True):
+    n = len(file_paths)
+    indices = np.arange(n)
+    while True:
+        if shuffle:
+            np.random.shuffle(indices)
+        for start in range(0, n, batch_size):
+            batch_idx = indices[start:start + batch_size]
+            images = []
+            batch_labels = []
+            for i in batch_idx:
+                try:
+                    img = load_img(file_paths[i], target_size=(224, 224))
+                    img = img_to_array(img) / 255.0
+                    images.append(img)
+                    batch_labels.append(labels[i])
+                except EEfficientNetB3 as e:
+                    print(f"Warning: couldn't load {file_paths[i]}: {str(e)}")
+            if len(images) == 0:
+                continue
+            yield np.array(images), np.array(batch_labels)
+
+# ---------------------------
+# Model builder
+# ---------------------------
+def create_custom_model(num_classes=NUM_CLASSES):
+    base_model = EfficientNetB3(input_shape=(224, 224, 3), include_top=False, weights='imagenet')
+    base_model.trainable = False  # freeze base
+    x = base_model.output
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dense(512, activation='relu', kernel_regularizer=regularizers.l2(0.001))(x)
+    x = layers.Dropout(0.5)(x)
+    predictions = layers.Dense(num_classes, activation='softmax')(x)
+    model = models.Model(inputs=base_model.input, outputs=predictions)
+    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    return model
+
+# ---------------------------
+# Utilities for flatten/unflatten weights
+# ---------------------------
+def flatten_weight_list(weight_list):
+    """
+    weight_list: list of numpy arrays (weights)
+    returns (flat_array, shapes, sizes)
+    """
+    shapes = [w.shape for w in weight_list]
+    sizes = [w.size for w in weight_list]
+    flat = np.concatenate([w.flatten() for w in weight_list]).astype(np.float64)
+    return flat, shapes, sizes
+
+def unflatten_to_weights(flat_array, shapes, sizes):
+    arrays = []
+    idx = 0
+    for shape, size in zip(shapes, sizes):
+        part = flat_array[idx: idx + size]
+        arrays.append(part.reshape(shape))
+        idx += size
+    return arrays
+
+# ---------------------------
+# Paillier helper functions
+# ---------------------------
+def encrypt_vector(pubkey, vector, scale=SCALE):
+    """Encode floats as ints by scaling, then encrypt each element."""
+    int_vec = np.round(vector * scale).astype(np.int64)
+    encrypted = [pubkey.encrypt(int(x)) for x in int_vec]
+    return encrypted
+
+def add_encrypted_vectors(enc_vecs):
+    """
+    enc_vecs: list of lists of EncryptedNumber (same length), from multiple clients
+    returns elementwise homomorphic sum: list of EncryptedNumber
+    """
+    # assume len(enc_vecs) >= 1
+    length = len(enc_vecs[0])
+    summed = []
+    for i in range(length):
+        s = enc_vecs[0][i]
+        for j in range(1, len(enc_vecs)):
+            s = s + enc_vecs[j][i]
+        summed.append(s)
+    return summed
+
+def decrypt_vector(privkey, enc_vector, scale=SCALE):
+    """Decrypt list of EncryptedNumber and scale back to floats."""
+    dec = np.array([privkey.decrypt(c) for c in enc_vector], dtype=np.float64)
+    return dec / scale
+
+# ---------------------------
+# Federated learning with Paillier-encrypted updates
+# ---------------------------
+class FederatedPaillier:
+    def __init__(self, clients_data, num_classes=NUM_CLASSES):
+        self.clients_data = clients_data
+        self.num_clients = len(clients_data)
+        self.global_model = create_custom_model(num_classes)
+        self.global_weights = self.global_model.get_weights()
+        # generate Paillier keypair (server holds private key in this simple demo)
+        self.pubkey, self.privkey = paillier.generate_paillier_keypair(n_length=2048)
+        print("Paillier keypair generated (2048-bit).")
+
+    def client_update_encrypt(self, client_data):
+        """
+        Client trains locally and returns encrypted weight delta (list of EncryptedNumber).
+        """
+        model = tf.keras.models.clone_model(self.global_model)
+        model.set_weights(self.global_weights)
+        model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+
+        x_paths, y_labels = client_data
+        steps = max(1, len(x_paths) // BATCH_SIZE)
+        train_gen = image_generator(x_paths, y_labels, BATCH_SIZE, shuffle=True)
+        # Do local training for EPOCHS (could be 1 in FL)
+        model.fit(train_gen, steps_per_epoch=steps, epochs=EPOCHS, verbose=1)
+
+        client_weights = model.get_weights()
+
+        # compute delta = client_weights - global_weights
+        deltas = [cw - gw for cw, gw in zip(client_weights, self.global_weights)]
+        flat_delta, shapes, sizes = flatten_weight_list(deltas)
+
+        # encrypt flattened delta vector
+        encrypted = encrypt_vector(self.pubkey, flat_delta, scale=SCALE)
+
+        # For the server to be able to unflatten after decrypting, we need shapes/sizes metadata
+        # Return encrypted delta and the shapes/sizes metadata
+        return encrypted, shapes, sizes
+
+    def aggregate_and_update(self, enc_deltas_list, shapes, sizes):
+        """
+        enc_deltas_list: list of encrypted flattened deltas (lists of EncryptedNumber), one per selected client
+        shapes, sizes: metadata for reconstructing arrays (assumed same for all clients)
+        """
+        # homomorphically add encrypted vectors elementwise
+        summed_enc = add_encrypted_vectors(enc_deltas_list)
+
+        # decrypt the summed vector
+        summed_plain = decrypt_vector(self.privkey, summed_enc, scale=SCALE)
+
+        # compute average delta
+        avg_delta = summed_plain / len(enc_deltas_list)
+
+        # reconstruct list-of-arrays weight deltas
+        delta_arrays = unflatten_to_weights(avg_delta, shapes, sizes)
+
+        # apply to global weights
+        new_global = [gw + da for gw, da in zip(self.global_weights, delta_arrays)]
+        self.global_weights = new_global
+        self.global_model.set_weights(self.global_weights)
+
+    def train(self, rounds=FED_ROUNDS, frac_clients=FRAC_CLIENTS):
+        for rnd in range(1, rounds + 1):
+            print(f"\n=== Federated Round {rnd}/{rounds} ===")
+            num_selected = max(1, int(frac_clients * self.num_clients))
+            selected = np.random.choice(range(self.num_clients), size=num_selected, replace=False)
+
+            enc_deltas = []
+            shapes = None
+            sizes = None
+
+            for client_id in selected:
+                print(f" -> Client {client_id}: training locally")
+                enc_delta, s_shapes, s_sizes = self.client_update_encrypt(self.clients_data[client_id])
+                enc_deltas.append(enc_delta)
+                shapes = s_shapes
+                sizes = s_sizes
+
+            # aggregate encrypted deltas and update global model
+            print(" -> Aggregating encrypted updates and decrypting aggregated result on server...")
+            self.aggregate_and_update(enc_deltas, shapes, sizes)
+
+# ---------------------------
+# Main
+# ---------------------------
+if __name__ == "__main__":
+    image_paths, labels, class_names = load_data(DATA_DIR)
+    print(f"Total images: {len(image_paths)}, classes: {class_names}")
+
+    # stratified train/test split
+    x_train, x_test, y_train, y_test = train_test_split(
+        image_paths, labels, test_size=0.2, random_state=SEED, stratify=labels
+    )
+
+    # Create IID clients
+    clients_data = create_iid_clients(x_train, y_train, NUM_CLIENTS)
+    for idx, (cx, cy) in enumerate(clients_data):
+        cnt = Counter(cy)
+        print(f"Client {idx}: samples={len(cx)}, class_dist={dict(cnt)}")
+
+    # instantiate federated training with Paillier
+    fed = FederatedPaillier(clients_data, num_classes=len(class_names))
+    fed.train(rounds=FED_ROUNDS, frac_clients=FRAC_CLIENTS)
+
+    # Evaluate global model
+    print("\nEvaluating global model on test set...")
+    test_model = create_custom_model(num_classes=len(class_names))
+    test_model.set_weights(fed.global_weights)
+
+    test_gen = image_generator(x_test, y_test, BATCH_SIZE, shuffle=False)
+    num_steps = (len(x_test) + BATCH_SIZE - 1) // BATCH_SIZE
+
+    y_pred = []
+    y_true = []
+
+    for _ in range(num_steps):
+        batch_x, batch_y = next(test_gen)
+        preds = test_model.predict(batch_x, verbose=0)
+        y_pred.extend(np.argmax(preds, axis=1))
+        y_true.extend(batch_y)
+
+    y_pred = np.array(y_pred)
+    y_true = np.array(y_true)
+
+    if len(y_pred) != len(y_true):
+        minlen = min(len(y_pred), len(y_true))
+        y_pred = y_pred[:minlen]
+        y_true = y_true[:minlen]
+
+    acc = np.mean(y_pred == y_true)
+    print(f"Test accuracy: {acc:.4f}")
+
+    print("\nClassification Report:")
+    print(classification_report(y_true, y_pred, target_names=class_names, zero_division=0))
+
+    print("\nConfusion matrix:")
+    cm = confusion_matrix(y_true, y_pred)
+    plt.figure(figsize=(8, 6))
+    plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+    plt.title('Confusion Matrix')
+    plt.colorbar()
+    ticks = np.arange(len(class_names))
+    plt.xticks(ticks, class_names, rotation=45)
+    plt.yticks(ticks, class_names)
+    thresh = cm.max() / 2.0 if cm.max() > 0 else 0.5
+    for i, j in np.ndindex(cm.shape):
+        plt.text(j, i, format(cm[i, j], 'd'), ha="center", va="center",
+                 color="white" if cm[i, j] > thresh else "black")
+    plt.tight_layout()
+    plt.show()
