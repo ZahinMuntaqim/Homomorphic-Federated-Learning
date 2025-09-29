@@ -1,0 +1,178 @@
+"""
+Measure timings and communication sizes for Paillier-encrypted model updates
+Outputs:
+ - per-client encryption time (s)
+ - simulated parallel encryption time (s) (max of client times)
+ - server aggregation (homomorphic addition) time (s)
+ - server decryption time (s)
+ - communication size per round (MB) (sum of serialized encrypted payloads from selected clients)
+ - total round time (s) = parallel_encryption_time + aggregation_time + decryption_time
+
+Requires: pip install phe tensorflow numpy pickle5
+Adjust NUM_CLIENTS_SELECTED and optionally use an actual model's weights instead of a random vector.
+"""
+
+import time
+import pickle
+import numpy as np
+from phe import paillier
+import tensorflow as tf
+from tensorflow.keras.applications import ResNet50V2
+from tensorflow.keras import layers, models, regularizers
+
+# ------------------------
+# Config
+# ------------------------
+NUM_CLIENTS = 4
+NUM_CLIENTS_SELECTED = 2           # number of clients participating this round
+SCALE = 10**6                      # same scaling used for encoding floats -> ints
+USE_MODEL_WEIGHTS = True           # if True, use actual model weights; otherwise random vector
+RANDOM_VECTOR_SIZE = 100000        # used if USE_MODEL_WEIGHTS is False
+SEED = 42
+
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+# ------------------------
+# Helper: build a small model to get realistic weight shapes
+# ------------------------
+def create_custom_model():
+    base = ResNet50V2(input_shape=(224,224,3), include_top=False, weights=None)  # weights=None to avoid download
+    x = base.output
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dense(128, activation='relu', kernel_regularizer=regularizers.l2(0.001))(x)
+    preds = layers.Dense(4, activation='softmax')(x)
+    model = models.Model(inputs=base.input, outputs=preds)
+    return model
+
+# ------------------------
+# Flatten / unflatten utils
+# ------------------------
+def flatten_weight_list(weight_list):
+    shapes = [w.shape for w in weight_list]
+    sizes = [w.size for w in weight_list]
+    flat = np.concatenate([w.flatten() for w in weight_list]).astype(np.float64)
+    return flat, shapes, sizes
+
+# ------------------------
+# Paillier encode/encrypt helpers
+# ------------------------
+def encode_and_encrypt_flat_vector(pubkey, flat_vector, scale=SCALE):
+    """
+    Scale floats -> ints and encrypt each integer element with Paillier.
+    Returns list of EncryptedNumber objects.
+    """
+    int_vec = np.round(flat_vector * scale).astype(np.int64)
+    enc = [pubkey.encrypt(int(x)) for x in int_vec]
+    return enc
+
+def homomorphic_add_lists(list_a, list_b):
+    # elementwise homomorphic addition of two lists of EncryptedNumber
+    return [a + b for a, b in zip(list_a, list_b)]
+
+def decrypt_flat_encrypted(privkey, enc_list, scale=SCALE):
+    dec_ints = np.array([privkey.decrypt(e) for e in enc_list], dtype=np.float64)
+    return dec_ints / scale
+
+# ------------------------
+# Main measurement routine
+# ------------------------
+def measure_round(num_clients=NUM_CLIENTS, num_selected=NUM_CLIENTS_SELECTED, use_model_weights=USE_MODEL_WEIGHTS):
+    # Generate keypair
+    pubkey, privkey = paillier.generate_paillier_keypair(n_length=2048)
+
+    # Prepare a flattened weight vector to represent the model update
+    if use_model_weights:
+        # Build a model and use its (random-initialized) weights for a realistic size
+        model = create_custom_model()
+        # get weights as numpy arrays
+        weights = model.get_weights()
+        flat_vector, shapes, sizes = flatten_weight_list(weights)
+    else:
+        flat_vector = np.random.randn(RANDOM_VECTOR_SIZE).astype(np.float64)
+        shapes = None
+        sizes = None
+
+    # Simulate each client generating the same-size delta (for simplicity)
+    clients_flat = [flat_vector.copy() for _ in range(num_clients)]
+
+    # Measure encryption times and serialized size of encrypted payload per selected client
+    encryption_times = []
+    serialized_sizes_bytes = []
+    encrypted_payloads = []  # keep for aggregation measurement
+
+    selected_indices = np.random.choice(range(num_clients), size=num_selected, replace=False)
+
+    print(f"Selected clients this round: {selected_indices.tolist()}")
+
+    for idx in selected_indices:
+        vec = clients_flat[idx]
+        t0 = time.perf_counter()
+        enc = encode_and_encrypt_flat_vector(pubkey, vec, scale=SCALE)
+        t1 = time.perf_counter()
+        enc_time = t1 - t0
+        encryption_times.append(enc_time)
+
+        # serialize encrypted payload to measure communication size
+        ser = pickle.dumps(enc)
+        serialized_sizes_bytes.append(len(ser))
+        encrypted_payloads.append(enc)
+        print(f"Client {idx}: encryption time = {enc_time:.4f} s, payload size = {len(ser)/1024/1024:.4f} MB")
+
+    # Simulated parallel encryption time: if clients encrypt in parallel, wall time is max of their times
+    parallel_encryption_time = max(encryption_times) if encryption_times else 0.0
+    total_comm_bytes = sum(serialized_sizes_bytes)
+    total_comm_mb = total_comm_bytes / (1024.0 * 1024.0)
+
+    # Server aggregation (homomorphic addition) time measurement
+    # We measure the time to elementwise add all selected encrypted vectors into a single encrypted vector
+    t0 = time.perf_counter()
+    # start from first encrypted vector and add rest
+    agg = encrypted_payloads[0]
+    for enc_vec in encrypted_payloads[1:]:
+        # elementwise addition
+        agg = homomorphic_add_lists(agg, enc_vec)
+    t1 = time.perf_counter()
+    aggregation_time = t1 - t0
+
+    # Server decryption time measurement (decrypt aggregated vector)
+    t0 = time.perf_counter()
+    decrypted = decrypt_flat_encrypted(privkey, agg, scale=SCALE)
+    t1 = time.perf_counter()
+    decryption_time = t1 - t0
+
+    # Total round time (wall-clock) approximation:
+    # - clients encrypt in parallel -> parallel_encryption_time
+    # - then server aggregates and decrypts -> aggregation_time + decryption_time
+    total_round_time = parallel_encryption_time + aggregation_time + decryption_time
+
+    # Report summary
+    summary = {
+        "per_client_encryption_times_s": encryption_times,
+        "parallel_encryption_time_s": parallel_encryption_time,
+        "aggregation_time_s": aggregation_time,
+        "decryption_time_s": decryption_time,
+        "communication_size_per_round_MB": total_comm_mb,
+        "total_round_time_s": total_round_time,
+        "num_selected_clients": num_selected,
+        "num_total_clients": num_clients,
+        "flatten_vector_length": len(flat_vector)
+    }
+
+    return summary
+
+# ------------------------
+# Run measurement and print nicely
+# ------------------------
+if __name__ == "__main__":
+    result = measure_round()
+    print("\n=== Measurement Summary ===")
+    print(f"Flattened vector length: {result['flatten_vector_length']}")
+    print(f"Selected clients: {result['num_selected_clients']} / {result['num_total_clients']}")
+    for i, t in enumerate(result['per_client_encryption_times_s']):
+        print(f"Client {i} encryption time: {t:.4f} s")
+    print(f"Simulated parallel encryption time (max client): {result['parallel_encryption_time_s']:.4f} s")
+    print(f"Server aggregation (homomorphic add) time: {result['aggregation_time_s']:.4f} s")
+    print(f"Server decryption time: {result['decryption_time_s']:.4f} s")
+    print(f"Communication size per round (sum of selected clients payloads): {result['communication_size_per_round_MB']:.4f} MB")
+    print(f"Approx. total round time (s): {result['total_round_time_s']:.4f} s")
